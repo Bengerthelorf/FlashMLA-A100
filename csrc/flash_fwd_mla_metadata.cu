@@ -2,7 +2,7 @@
 
 static constexpr int MaxBatchSize = 4096;
 
-__global__ void __launch_bounds__(256, 1, 1)
+__global__ void __launch_bounds__(256, 1)
 get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     int *seqlens_k_ptr = params.seqlens_k_ptr;
     int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;

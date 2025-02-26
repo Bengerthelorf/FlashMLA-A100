@@ -446,7 +446,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 }
 
 template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
-__global__ void __launch_bounds__(Kernel_traits::kNThreads, 1, 1)
+__attribute__((global)) void __attribute__((launch_bounds(Kernel_traits::kNThreads, 1)))
 flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
     const int m_block = blockIdx.x;
@@ -482,7 +482,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
-__global__ void __launch_bounds__(256, 1, 1)
+__attribute__((global)) void __attribute__((launch_bounds(256, 1)))
 flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
     constexpr int kNThreads = 128;
 
@@ -704,7 +704,7 @@ struct Flash_fwd_kernel_traits_mla_sm80 {
 
 // SM80-specific combine kernel
 template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
-__global__ void __launch_bounds__(256, 1, 1)
+__attribute__((global)) void __attribute__((launch_bounds(256, 1)))
 flash_fwd_splitkv_mla_combine_kernel_sm80(__grid_constant__ const Flash_fwd_mla_params params) {
     // 与SM90版本类似，但使用SM80兼容的操作
     constexpr int kNThreads = 128;
@@ -798,30 +798,3 @@ void run_mha_fwd_splitkv_mla_sm80(Flash_fwd_mla_params &params, cudaStream_t str
     // 临时解决方案：在 SM80 上调用 SM90 实现
     run_mha_fwd_splitkv_mla<T, Headdim>(params, stream);
 }
-
-// 添加显式模板实例化，确保编译能通过
-template void run_mha_fwd_splitkv_mla_sm80<cutlass::bfloat16_t, 576>(Flash_fwd_mla_params &params, cudaStream_t stream);
-
-// 定义 MLA_NUM_SPLITS_SWITCH 宏，确保正确调用
-#define MLA_NUM_SPLITS_SWITCH(num_splits, kMaxSplits, ...)                                        \
-    [&] {                                                                                         \
-        if (num_splits <= 32) {                                                                   \
-            constexpr static int kMaxSplits = 32;                                                 \
-            return [&] { __VA_ARGS__ }();                                                         \
-        } else if (num_splits <= 64) {                                                            \
-            constexpr static int kMaxSplits = 64;                                                 \
-            return [&] { __VA_ARGS__ }();                                                         \
-        } else if (num_splits <= 96) {                                                            \
-            constexpr static int kMaxSplits = 96;                                                 \
-            return [&] { __VA_ARGS__ }();                                                         \
-        } else if (num_splits <= 128) {                                                           \
-            constexpr static int kMaxSplits = 128;                                                \
-            return [&] { __VA_ARGS__ }();                                                         \
-        } else if (num_splits <= 160) {                                                           \
-            constexpr static int kMaxSplits = 160;                                                \
-            return [&] { __VA_ARGS__ }();                                                         \
-        } else {                                                                                  \
-            FLASH_ASSERT(false && "num_splits too large");                                        \
-            return [&] {}();                                                                      \
-        }                                                                                         \
-    }()
