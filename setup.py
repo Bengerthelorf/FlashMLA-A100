@@ -23,11 +23,13 @@ def get_sources():
     sources = [
         "csrc/flash_api.cpp",
         "csrc/flash_fwd_mla_bf16_sm90.cu",
+        "csrc/flash_fwd_mla_bf16_sm80.cu",
         "csrc/flash_fwd_mla_metadata.cu",
     ]
 
     if not DISABLE_FP16:
         sources.append("csrc/flash_fwd_mla_fp16_sm90.cu")
+        sources.append("csrc/flash_fwd_mla_fp16_sm80.cu")
 
     return sources
 
@@ -44,6 +46,8 @@ subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 cc_flag = []
 cc_flag.append("-gencode")
 cc_flag.append("arch=compute_90a,code=sm_90a")
+cc_flag.append("-gencode")
+cc_flag.append("arch=compute_80,code=sm_80")
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 

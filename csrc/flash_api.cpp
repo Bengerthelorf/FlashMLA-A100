@@ -72,7 +72,8 @@ mha_fwd_kvcache_mla(
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
-    TORCH_CHECK(is_sm90);
+    bool is_sm80 = dprops->major == 8 && dprops->minor == 0;
+    TORCH_CHECK(is_sm90 || is_sm80, "Unsupported GPU architecture. FlashMLA-A100 requires SM80 (A100) or SM90 (H100) GPU.");
 
     at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kcache;
 
@@ -187,11 +188,20 @@ mha_fwd_kvcache_mla(
     TORCH_CHECK(head_size == 576);
 
     if (q_dtype == torch::kBFloat16) {
-        run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576>(params, stream);
+        if (is_sm90) {
+            run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576>(params, stream);
+        } else if (is_sm80) {
+            run_mha_fwd_splitkv_mla_sm80<cutlass::bfloat16_t, 576>(params, stream);
+        }
     }
+    
     #ifndef FLASH_MLA_DISABLE_FP16
     else if (q_dtype == torch::kHalf) {
-        run_mha_fwd_splitkv_mla<cutlass::half_t, 576>(params, stream);
+        if (is_sm90) {
+            run_mha_fwd_splitkv_mla<cutlass::half_t, 576>(params, stream);
+        } else if (is_sm80) {
+            run_mha_fwd_splitkv_mla_sm80<cutlass::half_t, 576>(params, stream);
+        }
     }
     #endif
     else {

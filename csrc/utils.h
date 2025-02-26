@@ -67,6 +67,8 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 
 template <bool zero_init=false, int wg_wait=0, bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    // SM90 implementation 
     constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
     // Need to cast away const on tCrA since warpgroup_fence_operand doesn't take const
     if constexpr (Is_RS) { cute::warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
@@ -83,7 +85,6 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
             tiled_mma.accumulate_ = GMMA::ScaleOut::One;
         }
     } else {
-        // cute::gemm(tiled_mma, tCrA, tCrB, tCrC);
         // Unroll the K mode manually to set scale D to 1
         CUTLASS_PRAGMA_UNROLL
         for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
@@ -97,6 +98,23 @@ __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, T
     if constexpr (wg_wait >= 0) { warpgroup_wait<wg_wait>(); }
     warpgroup_fence_operand(tCrC);
     if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
+#else
+    // SM80 implementation
+    __syncthreads();
+    
+    // 简化的SM80实现
+    if constexpr (zero_init) {
+        cute::clear(tCrC);
+    }
+    
+    // 使用普通的gemm操作而不是warpgroup
+    CUTLASS_PRAGMA_UNROLL
+    for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
+        cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
+    }
+    
+    __syncthreads();
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
