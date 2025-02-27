@@ -67,130 +67,53 @@ static __device__ __forceinline__ T run(T x, Operator &op) {
 
 template <bool zero_init=false, int wg_wait=0, bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 __forceinline__ __device__ void gemm(TiledMma &tiled_mma, Tensor0 const &tCrA, Tensor1 const &tCrB, Tensor2 &tCrC) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-    // SM90 implementation 
-    constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
-    // Need to cast away const on tCrA since warpgroup_fence_operand doesn't take const
-    if constexpr (Is_RS) { cute::warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
-    warpgroup_fence_operand(tCrC);
-    if constexpr (arrive) {
-        warpgroup_arrive();
-    }
-    if constexpr (zero_init) {
-        tiled_mma.accumulate_ = GMMA::ScaleOut::Zero;
-        // Unroll the K mode manually to set scale D to 1
-        CUTLASS_PRAGMA_UNROLL
-        for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
-            cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
-            tiled_mma.accumulate_ = GMMA::ScaleOut::One;
-        }
-    } else {
-        // Unroll the K mode manually to set scale D to 1
-        CUTLASS_PRAGMA_UNROLL
-        for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
-            cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
-            tiled_mma.accumulate_ = GMMA::ScaleOut::One;
-        }
-    }
-    if constexpr (commit) {
-        warpgroup_commit_batch();
-    }
-    if constexpr (wg_wait >= 0) { warpgroup_wait<wg_wait>(); }
-    warpgroup_fence_operand(tCrC);
-    if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
-#else
-    // SM80 implementation
+    // 使用__syncthreads()进行同步
     __syncthreads();
     
-    // 简化的SM80实现
+    // 如果需要清零初始化
     if constexpr (zero_init) {
         cute::clear(tCrC);
     }
     
-    // 使用普通的gemm操作而不是warpgroup
+    // 对每个K块执行矩阵乘法
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
         cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
     }
     
+    // 同步以确保计算完成
     __syncthreads();
-#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
-// For SM90, convert acc_layout from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
 template<bool Transposed=false, typename Layout0>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout0 acc_layout) {
-    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
-        static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-        static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        auto l = acc_layout;
-        if constexpr (!Transposed) {
-            return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)));
-        } else {
-             return make_layout(make_layout(get<0, 0>(l), get<0, 2>(l), get<2>(l)), make_layout(get<0, 1>(l), get<1>(l)));
-        }
-
-    } else {  // SM80
-        static_assert(decltype(size<0>(acc_layout))::value == 4);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-        if constexpr (!Transposed) {
-            return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
-        } else {
-            return make_layout(make_layout(get<0, 0>(l), get<2>(l)), make_layout(get<0, 1>(l), get<1>(l)));
-        }
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
+    if constexpr (!Transposed) {
+        return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+    } else {
+        return make_layout(make_layout(get<0, 0>(l), get<2>(l)), make_layout(get<0, 1>(l), get<1>(l)));
     }
-};
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// For SM80, convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-// if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
-// For SM90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
-// For SM90, FP8, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((4, 2, 2), MMA_M, (N / 32, MMA_N))
 template<typename MMA_Traits, typename Layout0>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout0 acc_layout) {
-    using X = Underscore;
-    if constexpr (decltype(rank<0>(acc_layout))::value == 3) {  // SM90
-        static_assert(decltype(size<0, 0>(acc_layout))::value == 2);
-        static_assert(decltype(size<0, 1>(acc_layout))::value == 2);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        static_assert(decltype(rank(get<0>(acc_layout)))::value == 3);
-        if constexpr (sizeof(typename MMA_Traits::ValTypeA) == 2) {
-            auto l = logical_divide(get<0, 2>(acc_layout), Tile<_2>{});  // ((2, N / 16))
-            return make_layout(make_layout(get<0, 0>(acc_layout), get<0, 1>(acc_layout), get<0, 0>(l)), get<1>(acc_layout), coalesce(make_layout(get<0, 1>(l), get<2>(acc_layout))));
-        } else {
-            static_assert(sizeof(typename MMA_Traits::ValTypeA) == 1);
-            static_assert(decltype(stride<0, 0>(acc_layout))::value == 1);
-            static_assert(decltype(stride<0, 1>(acc_layout))::value == 2);
-            auto l = logical_divide(get<0, 2>(acc_layout), Tile<Layout<Shape<_2, _2>>>{});  // (((2, 2), N / 32))
-            // This combines the first two modes (<0, 0> and <0, 1>) into one mode.
-            // Will require register shuffling later to be correct.
-            return make_layout(make_layout(Layout<_4>{}, get<0, 0, 0>(l), get<0, 0, 1>(l)),
-                               get<1>(acc_layout),
-                               coalesce(make_layout(get<0, 1>(l), get<2>(acc_layout))));  // ((4, 2, 2), MMA_M, N / 32 * MMA_N)
-            // This combination is right but doesn't work with register shuffling.
-            // return make_layout(make_layout(coalesce(make_layout(get<0, 0>(acc_layout), get<0, 0, 0>(l))), get<0, 1>(acc_layout), get<0, 0, 1>(l)),
-            //                    get<1>(acc_layout),
-            //                    coalesce(make_layout(get<0, 1>(l), get<2>(acc_layout))));
-        }
-    } else {  // SM80
-        static_assert(decltype(size<0>(acc_layout))::value == 4);
-        static_assert(decltype(rank(acc_layout))::value == 3);
-        constexpr int mma_shape_K = get<2>(typename MMA_Traits::Shape_MNK{});
-        static_assert(mma_shape_K == 8 || mma_shape_K == 16);
-        if constexpr (mma_shape_K == 8) {
-            return acc_layout;
-        } else {
-            auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
-            return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
-        }
+    static_assert(decltype(size<0>(acc_layout))::value == 4);
+    static_assert(decltype(rank(acc_layout))::value == 3);
+    constexpr int mma_shape_K = get<2>(typename MMA_Traits::Shape_MNK{});
+    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
+    if constexpr (mma_shape_K == 8) {
+        return acc_layout;
+    } else {
+        auto l = logical_divide(acc_layout, Shape<Underscore, Underscore, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
+        return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
     }
-};
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -207,10 +130,6 @@ __forceinline__ __device__ auto convert_type(Tensor<Engine, Layout> const &tenso
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Blocks until all but N previous cp.async.commit_group operations have committed.
-// This differs from cute::cp_async_wait in that when N = 0 we don't call cp.async.wait_all
-// (which is equivalent to commit_group then wait_group 0).
-// Instead we just call cp.async.wait_group 0, which is slightly faster.
-// https://github.com/NVIDIA/cutlass/blob/master/include/cute/arch/copy_sm80.hpp#L113
 template <int N>
 CUTE_HOST_DEVICE
 void cp_async_wait() {

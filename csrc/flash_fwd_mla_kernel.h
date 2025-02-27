@@ -7,7 +7,7 @@
 
 using namespace cute;
 
-#include "named_barrier.h"
+#include "named_barrier.h"  // 保留以维持兼容性，但不使用其功能
 #include "utils.h"
 #include "softmax.h"
 #include "static_switch.h"
@@ -19,15 +19,15 @@ constexpr auto getSmemLayoutK() {
     constexpr int headSizeBytes = sizeof(PrecType) * DIM;
     constexpr int headSizeBytes2 = sizeof(PrecType) * DIM2;
 
-    if constexpr (headSizeBytes % 128 == 0 && headSizeBytes2 % 128 == 0) {
-        return GMMA::Layout_K_SW128_Atom<PrecType>{};
-    } else if constexpr (headSizeBytes % 64 == 0 && headSizeBytes2 % 64 == 0) {
-        return GMMA::Layout_K_SW64_Atom<PrecType>{};
+    // 仅使用SM80兼容的布局
+    if constexpr (headSizeBytes % 64 == 0 && headSizeBytes2 % 64 == 0) {
+        return cute::Layout<Shape<_64, _1>, Stride<_1, _64>>{};  // 使用简单布局替代GMMA布局
     } else {
-        return GMMA::Layout_K_SW32_Atom<PrecType>{};
+        return cute::Layout<Shape<_32, _1>, Stride<_1, _32>>{};
     }
 }
 
+// SM80特化的特征结构体
 template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
 struct Flash_fwd_kernel_traits_mla {
     using Element = elem_type;
@@ -36,7 +36,7 @@ struct Flash_fwd_kernel_traits_mla {
 
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;
-    static constexpr int kNWarpsS = 4;
+    static constexpr int kNWarpsS = 4;  // 添加这里的定义，修复未定义kNWarpsS问题
     static constexpr int kNThreadsS = kNWarpsS * 32;
 
     static constexpr int kBlockM = kBlockM_;
@@ -49,74 +49,75 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
     static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
 
-    using TiledMma = decltype(make_tiled_mma(
-            cute::GMMA::ss_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>,
-                    GMMA::Major::K, GMMA::Major::K>(),
-            Layout<Shape<Int<kNWarpsS / 4>, _1, _1>>{}));
+    // 使用简单的MMA操作替代GMMA (Hopper特有)
+    using TiledMma = decltype(
+        cute::make_tile_mma(cute::shape<kBlockM, kBlockN, kHeadDim>{})
+    );
 
     static constexpr int AtomLayoutNO = kNThreads / kNThreadsS;
-    using TiledMmaO = decltype(make_tiled_mma(
-            cute::GMMA::rs_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kHeadDimV / AtomLayoutNO>, Int<kBlockN>>,
-                    GMMA::Major::K, GMMA::Major::MN>(),
-            Layout<Shape<Int<kNWarpsS / 4>, Int<AtomLayoutNO>, _1>>{}));
+    using TiledMmaO = decltype(
+        cute::make_tile_mma(cute::shape<kBlockM, kHeadDimV / AtomLayoutNO, kBlockN>{})
+    );
 
     using SmemLayoutQ = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim>(),
-            Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+            cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDim>>{}));
 
     using SmemLayoutK = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
-            Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+            cute::Shape<cute::Int<kBlockN>, cute::Int<kHeadDim>>{}));
 
     using SmemLayoutV = decltype(tile_to_shape(
             getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
-            Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
-    using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
+            cute::Shape<cute::Int<kBlockN>, cute::Int<kHeadDimV>>{}));
+    using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, 
+            cute::make_layout(cute::Shape<cute::Int<kHeadDimV>, cute::Int<kBlockN>>{}, cute::GenRowMajor{})));
 
-    using SmemLayoutP = Layout<Shape<Shape<_2, _2>, Int<kNThreadsS>, _1, Int<kBlockN / 8>>>;
-    using SmemLayoutRow = Layout<Shape<_2, Int<kNThreadsS>>, Stride<_1, _2>>;
+    using SmemLayoutP = cute::Layout<cute::Shape<cute::Shape<cute::_2, cute::_2>, cute::Int<kNThreadsS>, cute::_1, cute::Int<kBlockN / 8>>>;
+    using SmemLayoutRow = cute::Layout<cute::Shape<cute::_2, cute::Int<kNThreadsS>>, cute::Stride<cute::_1, cute::_2>>;
 
     using SmemLayoutAtomO = decltype(composition(
-            Swizzle<kSwizzle, 3, 3>{},
-            Layout<Shape<Int<8>, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
+            cute::Swizzle<kSwizzle, 3, 3>{},
+            cute::Layout<cute::Shape<cute::Int<8>, cute::Int<kBlockKSmem>>, cute::Stride<cute::Int<kBlockKSmem>, cute::_1>>{}));
     using SmemLayoutO = decltype(tile_to_shape(
             SmemLayoutAtomO{},
-            Shape<Int<kBlockM>, Int<kHeadDimV>>{}));
-    using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
-    using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
+            cute::Shape<cute::Int<kBlockM>, cute::Int<kHeadDimV>>{}));
+    using SmemCopyAtomO = cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+    using SmemCopyAtomOaccum = cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
 
+    // 修复Layout定义
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
     static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
-    using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
+    using Gmem_copy_struct = cute::SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
     static constexpr int kNThreadsLoad = kNThreads - kNThreadsS;
     static_assert(kNThreadsLoad % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
 
-    using GmemLayoutAtom = Layout<
-            Shape<Int<kNThreadsLoad / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-            Stride<Int<kGmemThreadsPerRow>, _1>>;
-    using GmemTiledCopy = decltype(make_tiled_copy(
-            Copy_Atom<Gmem_copy_struct, Element>{},
+    using GmemLayoutAtom = cute::Layout
+            cute::Shape<cute::Int<kNThreadsLoad / kGmemThreadsPerRow>, cute::Int<kGmemThreadsPerRow>>,
+            cute::Stride<cute::Int<kGmemThreadsPerRow>, cute::_1>>;
+    using GmemTiledCopy = decltype(cute::make_tiled_copy(
+            cute::Copy_Atom<Gmem_copy_struct, Element>{},
             GmemLayoutAtom{},
-            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+            cute::Layout<cute::Shape<cute::_1, cute::_8>>{})); 
 
-    using GmemLayoutAtomO = Layout<
-            Shape<Int<kNThreadsS / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-            Stride<Int<kGmemThreadsPerRow>, _1>>;
-    using GmemTiledCopyO = decltype(make_tiled_copy(
-            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+    using GmemLayoutAtomO = cute::Layout
+            cute::Shape<cute::Int<kNThreadsS / kGmemThreadsPerRow>, cute::Int<kGmemThreadsPerRow>>,
+            cute::Stride<cute::Int<kGmemThreadsPerRow>, cute::_1>>;
+    using GmemTiledCopyO = decltype(cute::make_tiled_copy(
+            cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
             GmemLayoutAtomO{},
-            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+            cute::Layout<cute::Shape<cute::_1, cute::_8>>{}));
 
     static constexpr int kGmemElemsPerLoadAccum = sizeof(cute::uint128_t) / sizeof(ElementAccum);
     static constexpr int kGmemThreadsPerRowAccum = kBlockKSmem / kGmemElemsPerLoadAccum;
-    using GmemLayoutAtomOaccum = Layout<
-            Shape<Int<kNThreadsS / kGmemThreadsPerRowAccum>, Int<kGmemThreadsPerRowAccum>>,
-            Stride<Int<kGmemThreadsPerRowAccum>, _1>>;
-    using GmemTiledCopyOaccum = decltype(make_tiled_copy(
-            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+    using GmemLayoutAtomOaccum = cute::Layout
+            cute::Shape<cute::Int<kNThreadsS / kGmemThreadsPerRowAccum>, cute::Int<kGmemThreadsPerRowAccum>>,
+            cute::Stride<cute::Int<kGmemThreadsPerRowAccum>, cute::_1>>;
+    using GmemTiledCopyOaccum = decltype(cute::make_tiled_copy(
+            cute::Copy_Atom<cute::AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
             GmemLayoutAtomOaccum{},
-            Layout<Shape<_1, _4>>{}));  // Val layout, 4 vals per store
+            cute::Layout<cute::Shape<cute::_1, cute::_4>>{}));
 };
 
 namespace flash {
@@ -166,7 +167,7 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
     using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(shared_storage.smem_o.data())), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
     // Partition sO to match the accumulator partitioning
-    using SmemTiledCopyO = std::conditional_t<
+    using SmemTiledCopyO = std::conditional_t
             !Split,
             typename Kernel_traits::SmemCopyAtomO,
             typename Kernel_traits::SmemCopyAtomOaccum
@@ -269,8 +270,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
     flash::Softmax<2 * size<1>(tOrO)> softmax;
 
-    int warp_group_idx = cutlass::canonical_warp_group_idx();
-    if (warp_group_idx == 0) {
+    int warp_idx = tidx / 32;
+    if (warp_idx < (kNWarpsS / 4)) {
         typename Kernel_traits::TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_thread_slice(tidx);
         Tensor tSrQ = thr_mma.partition_fragment_A(sQ);                           // (MMA,MMA_M,MMA_K)
@@ -327,7 +328,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             cute::copy(rP, tPsP);
             cute::copy(scale_o, tScale_osScale_o);
 
-            cutlass::arch::NamedBarrier::arrive(kNThreads, static_cast<int>(NamedBarriers::SReady));
+            // 替换NamedBarrier为__syncthreads
+            __syncthreads();
 
             flash::rescale_o(tOrO, scale_o);
 
@@ -342,7 +344,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
         cute::copy(softmax.row_max, tRow_maxsRow_max);
         cute::copy(softmax.row_sum, tRow_sumsRow_sum);
-        cutlass::arch::NamedBarrier::arrive(kNThreads, static_cast<int>(NamedBarriers::SoftmaxReady));
+        
+        // 替换NamedBarrier为__syncthreads
+        __syncthreads();
     } else {
         const int *block_table = params.block_table + bidb * params.block_table_batch_stride;
         int cur_block_table = __ldg(&block_table[n_block]);
@@ -411,7 +415,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 cute::cp_async_fence();
             }
 
-            cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::SReady));
+            // 替换NamedBarrier为__syncthreads
+            __syncthreads();
 
             if (n_block - 2 >= n_block_min) {
                 cur_block_table = __ldg(&block_table[n_block - 2]);
@@ -434,7 +439,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             tOrVt.data() = tOrVt.data() + sK_offset / 8;
         }
 
-        cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::SoftmaxReady));
+        // 替换NamedBarrier为__syncthreads
+        __syncthreads();
+        
         cute::copy(tRow_maxsRow_max, softmax.row_max);
         cute::copy(tRow_sumsRow_sum, softmax.row_sum);
     }
@@ -446,8 +453,8 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 }
 
 template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
-__attribute__((global)) void __attribute__((launch_bounds(Kernel_traits::kNThreads, 1)))
-flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
+__global__ void __launch_bounds__(Kernel_traits::kNThreads, 1)
+flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const Flash_fwd_mla_params params) {
     constexpr int kBlockN = Kernel_traits::kBlockN;
     const int m_block = blockIdx.x;
     const int bidh = blockIdx.y;
@@ -482,8 +489,8 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
-__attribute__((global)) void __attribute__((launch_bounds(256, 1)))
-flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_params params) {
+__global__ void __launch_bounds__(256, 1)
+flash_fwd_splitkv_mla_combine_kernel_sm80(__grid_constant__ const Flash_fwd_mla_params params) {
     constexpr int kNThreads = 128;
 
     const int tidx = threadIdx.x;
@@ -506,7 +513,8 @@ flash_fwd_splitkv_mla_combine_kernel(__grid_constant__ const Flash_fwd_mla_param
     Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
                               Shape<_1>{}, Stride<_1>{});
 
-    int warp_idx = cutlass::canonical_warp_idx_sync();
+    // SM80兼容的warp_idx计算方式
+    int warp_idx = tidx / 32;
     if (warp_idx == 0) {
         constexpr int kNLsePerThread = cute::ceil_div(kMaxSplits, 32);
 
@@ -577,224 +585,59 @@ void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params &params, cudaStream_t stream
     FLASH_ASSERT(params.page_block_size == Kernel_traits::kBlockN);
     const int num_m_block = cute::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
     BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-        auto kernel = &flash::flash_fwd_splitkv_mla_kernel<Kernel_traits, Is_causal, SharedStorage>;
+        auto kernel = &flash::flash_fwd_splitkv_mla_kernel_sm80<Kernel_traits, Is_causal, SharedStorage>;
         constexpr size_t smem_size = sizeof(SharedStorage);
-        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+        // 增加共享内存限制，A100最大支持约164KB
+        CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 100*1024));
         kernel<<<dim3(num_m_block, params.h, params.num_sm_parts), Kernel_traits::kNThreads, smem_size, stream>>>(params);
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 
     dim3 grid_combine(params.b * params.h * params.seqlen_q);
-    MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
-        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel<
+    // MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
+    //     auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel_sm80
+    //             typename Kernel_traits::Element, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
+    //     combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+    // });
+    if (params.num_sm_parts <= 32) {
+        constexpr int kMaxSplits = 32;
+        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel_sm80
                 typename Kernel_traits::Element, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
         combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
-    });
+    } else if (params.num_sm_parts <= 64) {
+        constexpr int kMaxSplits = 64;
+        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel_sm80
+                typename Kernel_traits::Element, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
+        combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+    } else if (params.num_sm_parts <= 96) {
+        constexpr int kMaxSplits = 96;
+        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel_sm80
+                typename Kernel_traits::Element, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
+        combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+    } else if (params.num_sm_parts <= 128) {
+        constexpr int kMaxSplits = 128;
+        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel_sm80
+                typename Kernel_traits::Element, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
+        combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+    } else if (params.num_sm_parts <= 160) {
+        constexpr int kMaxSplits = 160;
+        auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel_sm80
+                typename Kernel_traits::Element, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
+        combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
+    } else {
+        FLASH_ASSERT(false);
+    }
+
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template<typename T, int Headdim>
-void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream) {
+void run_mha_fwd_splitkv_mla_sm80(Flash_fwd_mla_params &params, cudaStream_t stream) {
     static_assert(Headdim == 576);
     FLASH_ASSERT(params.d_v == 512);
     FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
+    
+    // 使用SM80特化的特征结构体
     using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, 512>;
     run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
-}
-
-// SM80 specific kernel traits for A100 GPUs
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
-struct Flash_fwd_kernel_traits_mla_sm80 {
-    using Element = elem_type;
-    using ElementAccum = float;
-    using index_t = int64_t;
-
-    static constexpr int kNWarps = kNWarps_;
-    static constexpr int kNThreads = kNWarps * 32;
-    static constexpr int kNWarpsS = 4;
-    static constexpr int kNThreadsS = kNWarpsS * 32;
-
-    static constexpr int kBlockM = kBlockM_;
-    static constexpr int kBlockN = kBlockN_;
-    static constexpr int kHeadDim = kHeadDim_;
-    static_assert(kHeadDim % 32 == 0);
-    static constexpr int kHeadDimV = kHeadDimV_ != 0 ? kHeadDimV_ : kHeadDim;
-    static_assert(kHeadDimV % 32 == 0);
-    static_assert(kHeadDimV <= kHeadDim);
-    
-    // SM80 specific configurations
-    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
-    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
-
-    // 为了简化，这里直接使用与SM90相同的类型，实际上SM80应该使用不同的MMA配置
-    using TiledMma = decltype(make_tiled_mma(
-            cute::GMMA::ss_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>,
-                    GMMA::Major::K, GMMA::Major::K>(),
-            Layout<Shape<Int<kNWarpsS / 4>, _1, _1>>{}));
-
-    static constexpr int AtomLayoutNO = kNThreads / kNThreadsS;
-    using TiledMmaO = decltype(make_tiled_mma(
-            cute::GMMA::rs_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kHeadDimV / AtomLayoutNO>, Int<kBlockN>>,
-                    GMMA::Major::K, GMMA::Major::MN>(),
-            Layout<Shape<Int<kNWarpsS / 4>, Int<AtomLayoutNO>, _1>>{}));
-
-    // 其余布局与SM90相同
-    using SmemLayoutQ = decltype(tile_to_shape(
-            getSmemLayoutK<Element, kHeadDim>(),
-            Shape<Int<kBlockM>, Int<kHeadDim>>{}));
-
-    using SmemLayoutK = decltype(tile_to_shape(
-            getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
-            Shape<Int<kBlockN>, Int<kHeadDim>>{}));
-
-    using SmemLayoutV = decltype(tile_to_shape(
-            getSmemLayoutK<Element, kHeadDim, kHeadDimV>(),
-            Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
-    using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
-
-    using SmemLayoutP = Layout<Shape<Shape<_2, _2>, Int<kNThreadsS>, _1, Int<kBlockN / 8>>>;
-    using SmemLayoutRow = Layout<Shape<_2, Int<kNThreadsS>>, Stride<_1, _2>>;
-
-    using SmemLayoutAtomO = decltype(composition(
-            Swizzle<kSwizzle, 3, 3>{},
-            Layout<Shape<Int<8>, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
-    using SmemLayoutO = decltype(tile_to_shape(
-            SmemLayoutAtomO{},
-            Shape<Int<kBlockM>, Int<kHeadDimV>>{}));
-            
-    // SM80使用不同的Copy_Atom
-    using SmemCopyAtomO = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
-    using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
-
-    static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
-    static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
-    static constexpr int kGmemThreadsPerRow = kBlockKSmem / kGmemElemsPerLoad;
-    
-    // SM80使用不同的Gmem_copy_struct
-    using Gmem_copy_struct = SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>;
-    static constexpr int kNThreadsLoad = kNThreads - kNThreadsS;
-    static_assert(kNThreadsLoad % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
-
-    using GmemLayoutAtom = Layout<
-            Shape<Int<kNThreadsLoad / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-            Stride<Int<kGmemThreadsPerRow>, _1>>;
-    using GmemTiledCopy = decltype(make_tiled_copy(
-            Copy_Atom<Gmem_copy_struct, Element>{},
-            GmemLayoutAtom{},
-            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
-
-    using GmemLayoutAtomO = Layout<
-            Shape<Int<kNThreadsS / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-            Stride<Int<kGmemThreadsPerRow>, _1>>;
-    using GmemTiledCopyO = decltype(make_tiled_copy(
-            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
-            GmemLayoutAtomO{},
-            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
-
-    static constexpr int kGmemElemsPerLoadAccum = sizeof(cute::uint128_t) / sizeof(ElementAccum);
-    static constexpr int kGmemThreadsPerRowAccum = kBlockKSmem / kGmemElemsPerLoadAccum;
-    using GmemLayoutAtomOaccum = Layout<
-            Shape<Int<kNThreadsS / kGmemThreadsPerRowAccum>, Int<kGmemThreadsPerRowAccum>>,
-            Stride<Int<kGmemThreadsPerRowAccum>, _1>>;
-    using GmemTiledCopyOaccum = decltype(make_tiled_copy(
-            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
-            GmemLayoutAtomOaccum{},
-            Layout<Shape<_1, _4>>{}));  // Val layout, 4 vals per store
-};
-
-// SM80-specific combine kernel
-template<typename Element, typename ElementAccum, typename index_t, int kHeadDimV, int kMaxSplits>
-__attribute__((global)) void __attribute__((launch_bounds(256, 1)))
-flash_fwd_splitkv_mla_combine_kernel_sm80(__grid_constant__ const Flash_fwd_mla_params params) {
-    // 与SM90版本类似，但使用SM80兼容的操作
-    constexpr int kNThreads = 128;
-
-    const int tidx = threadIdx.x;
-    const int bidx = blockIdx.x;
-    const int hs = params.h * params.seqlen_q;
-    const int batch_idx = bidx / hs;
-    const int hs_idx = bidx % hs;
-
-    const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
-    const int actual_num_splits = __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
-    FLASH_DEVICE_ASSERT(actual_num_splits <= kMaxSplits);
-    if (actual_num_splits == 1) return;
-
-    __shared__ ElementAccum sLseScale[kMaxSplits];
-
-    const index_t row_offset_lseaccum = split_offset * hs + hs_idx;
-    const index_t row_offset_lse = bidx;
-    Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lseaccum_ptr) + row_offset_lseaccum),
-                                   Shape<Int<kMaxSplits>>{}, make_stride(hs));
-    Tensor gLSE = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr) + row_offset_lse),
-                              Shape<_1>{}, Stride<_1>{});
-
-    int warp_idx = tidx / 32;
-    if (warp_idx == 0) {
-        constexpr int kNLsePerThread = cute::ceil_div(kMaxSplits, 32);
-
-        float local_lse[kNLsePerThread];
-        for (int i = 0; i < kNLsePerThread; ++i) {
-            const int split = i * 32 + tidx;
-            local_lse[i] = split < actual_num_splits ? gLSEaccum(split) : -INFINITY;
-        }
-
-        float max_lse = -INFINITY;
-        for (int i = 0; i < kNLsePerThread; ++i) max_lse = max(max_lse, local_lse[i]);
-        for (int offset = 16; offset >= 1; offset /= 2) max_lse = max(max_lse, __shfl_xor_sync(uint32_t(-1), max_lse, offset));
-        max_lse = max_lse == -INFINITY ? 0.0f : max_lse;  // In case all local LSEs are -inf
-
-        float sum_lse = 0;
-        for (int i = 0; i < kNLsePerThread; ++i) sum_lse = sum_lse + expf(local_lse[i] - max_lse);
-        for (int offset = 16; offset >= 1; offset /= 2) sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
-
-        float global_lse = (sum_lse == 0.f || sum_lse != sum_lse) ? INFINITY : logf(sum_lse) + max_lse;
-        if (tidx == 0) gLSE(0) = global_lse;
-
-        for (int i = 0; i < kNLsePerThread; ++i) {
-            const int split = i * 32 + tidx;
-            if (split < actual_num_splits) sLseScale[split] = expf(local_lse[i] - global_lse);
-        }
-    }
-    __syncthreads();
-
-    static_assert(kHeadDimV % kNThreads == 0);
-    constexpr int Elements = kHeadDimV / kNThreads;
-    const index_t row_offset_oaccum = (split_offset * hs + hs_idx) * kHeadDimV;
-    Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(params.oaccum_ptr) + row_offset_oaccum),
-                                 Shape<Int<kHeadDimV>>{}, Stride<_1>{});
-    using GmemTiledCopyOaccum = decltype(make_tiled_copy(
-            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
-            Layout<Shape<Int<kNThreads>>>{},
-            Layout<Shape<Int<Elements>>>{}));
-    GmemTiledCopyOaccum gmem_tiled_copy_Oaccum;
-    auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
-    Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_S(gOaccum);
-    Tensor tOrOaccum = make_tensor<ElementAccum>(shape(tOgOaccum));
-    Tensor tOrO = make_tensor<ElementAccum>(shape(tOgOaccum));
-    clear(tOrO);
-
-    for (int split = 0; split < actual_num_splits; ++split) {
-        cute::copy(tOgOaccum, tOrOaccum);
-        ElementAccum lse_scale = sLseScale[split];
-        for (int i = 0; i < size(tOrO); ++i) {
-            tOrO(i) += lse_scale * tOrOaccum(i);
-        }
-        tOgOaccum.data() = tOgOaccum.data() + hs * kHeadDimV;
-    }
-
-    Tensor rO = flash::convert_type<Element>(tOrO);
-    const int head_idx = (bidx - batch_idx * hs) / params.seqlen_q;
-    const int row = bidx - batch_idx * hs - head_idx * params.seqlen_q;
-    auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride + head_idx * params.o_head_stride + row * params.o_row_stride;
-    Tensor gO = make_tensor(make_gmem_ptr(o_ptr + tidx * Elements), Shape<Int<decltype(size<0>(rO))::value>>{}, Stride<_1>{});
-    cute::copy(rO, gO);
-}
-
-// 简化版的 SM80 实现
-// 为了编译通过，这里直接使用 SM90 实现作为临时解决方案
-template<typename T, int Headdim>
-void run_mha_fwd_splitkv_mla_sm80(Flash_fwd_mla_params &params, cudaStream_t stream) {
-    // 临时解决方案：在 SM80 上调用 SM90 实现
-    run_mha_fwd_splitkv_mla<T, Headdim>(params, stream);
 }

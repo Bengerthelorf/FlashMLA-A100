@@ -1,6 +1,6 @@
 #pragma once
 
-#include "cutlass/barrier.h"
+// #include "cutlass/barrier.h"
 
 namespace flash {
 

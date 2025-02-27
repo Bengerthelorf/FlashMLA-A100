@@ -48,10 +48,6 @@ static constexpr int TileSchedulerMetaDataSize = 8;
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename T, int Headdim>
-void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream);
-
-// Add function declaration for SM80 version
-template<typename T, int Headdim>
 void run_mha_fwd_splitkv_mla_sm80(Flash_fwd_mla_params &params, cudaStream_t stream);
 
 struct Mla_metadata_params {
